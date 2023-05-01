@@ -1,6 +1,8 @@
+import base64
 import os
 import re
 
+import camelot
 import fitz
 from loguru import logger
 from pdfminer.high_level import extract_pages
@@ -189,9 +191,7 @@ def extract_images(pdf_file, page_idx):
 
 
 def extract_tables(pdf_file, page_idx):
-    pdf = pdfplumber.open(pdf_file)
-    page = pdf.pages[page_idx]
-    tables = page.find_tables()
+    tables = camelot.read_pdf(pdf_file, pages=f"{page_idx+1}", line_scale=35)
 
     return tables
 
@@ -222,7 +222,7 @@ def extract_page_elements(pdf_file, page_idx):
     height = page.bbox[3]
     tables = extract_tables(pdf_file, page_idx)
     images = extract_images(pdf_file, page_idx)
-    elements = [(table, convert_bbox(table.bbox, height)) for table in tables] + [(image, convert_bbox(image["bbox"], height)) for image in images]
+    elements = [(table, table._bbox) for table in tables] + [(image, convert_bbox(image["bbox"], height)) for image in images]
     bboxes = extract_head_foot_note(pdf_file)
     bboxes.extend([element[1] for element in elements])
     lines = extract_lines_not_within_bboxes(page, bboxes)
@@ -248,7 +248,7 @@ def str2number(num_str):
 
 
 serial_numbers = [r"(?P<number>[一二三四五六七八九十]+)([、.]|\s).+", r"(?P<number>\d+)\.[^\d]+", r"\((?P<number>[一二三四五六七八九十]+)\).+",
-                  r"\((?P<number>\d+)\)[.|\s].+", r"(?P<number>\d+)、.+"]
+                  r"[(]?(?P<number>\d+)\)[.|\s].+", r"(?P<number>\d+)、.+"]
 patterns = [re.compile(item) for item in serial_numbers]
 
 
@@ -318,24 +318,28 @@ def segment_paragraph(lines):
     para = ""
     prev_len = None
     indent = None
+    max_len = max(line.bbox[2] - line.bbox[0] for line in lines)
     for i, line in enumerate(lines):
         length = line.bbox[2] - line.bbox[0]
         text = line.get_text().strip()
         if i > 0:
             indent = line.bbox[0] - lines[i-1].bbox[0]
-
         if indent is not None and indent > 20:
             if para:
                 paragraphs.append(para)
             para = text
             prev_len = length
         elif prev_len is not None:
-            if any(pattern.match(text) for pattern in patterns) or prev_len < length:
+            if any(pattern.match(text) for pattern in patterns):
                 paragraphs.append(para)
-                paragraphs.append(text)
-                prev_len = None
-                para = ""
-            elif prev_len - length > prev_len * 0.1:
+                if length < max_len * 0.9:
+                    paragraphs.append(text)
+                    prev_len = None
+                    para = ""
+                else:
+                    prev_len = length
+                    para = text
+            elif length < 0.9 * prev_len:
                 para += text
                 paragraphs.append(para)
                 para = ""
@@ -344,8 +348,11 @@ def segment_paragraph(lines):
                 para += text
                 prev_len = length
         else:
-            para = text
-            prev_len = length
+            if length < max_len * 0.8:
+                paragraphs.append(text)
+            else:
+                para = text
+                prev_len = length
 
     if para:
         paragraphs.append(para)
@@ -374,7 +381,7 @@ def arrange_elements(elements):
     return new_elements
 
 
-def extract_section_elements(pdf_file):
+def extract_pdf_elements(pdf_file):
     pdf = pdfplumber.open(pdf_file)
     page_num = len(pdf.pages)
     pdf.close()
@@ -390,46 +397,71 @@ def extract_section_elements(pdf_file):
                     if not pages[-1]:
                         pages.pop()
                     break
+    else:
+        for i, element in enumerate(pages[0]):
+            if isinstance(element, LTTextLineHorizontal):
+                if section_title.search(element.get_text()):
+                    pages[0] = pages[0][:i]
+                    break
     all_elements = []
     for page in pages:
-        for element in page:
+        for i, element in enumerate(page):
             if isinstance(element, LTTextLineHorizontal):
                 all_elements.append({"line": element})
             elif isinstance(element, dict):
                 all_elements.append(element)
             else:
-                if all_elements and "line" in all_elements[-1]:
-                    table = {"table": element}
-                    text = all_elements[-1]["line"].get_text()
-                    if "单位:" in text or "单位：" in text:
-                        head_note = text.strip()
-                        all_elements.pop()
-                        table["head_note"] = head_note
+                table = {"table": element}
+                if all_elements:
+                    if "line" in all_elements[-1]:
+                        text = all_elements[-1]["line"].get_text()
+                        if "单位:" in text or "单位：" in text:
+                            head_note = text.strip()
+                            all_elements.pop()
+                            table["head_note"] = head_note
+                    elif i == 0 and "table" in all_elements[-1]:
+                        prev_table = all_elements[-1]["table"]
+                        if len(element.df.columns) == len(prev_table.df.columns):
+                            prev_table.df = prev_table.df.append(element.df)
+                            table = None
+                if table:
                     all_elements.append(table)
     elements = arrange_elements(all_elements)
 
     return elements
 
 
-if __name__ == "__main__":
-    from api import download_annual_reports
-
-    # download_annual_reports("格力电器", "data", 1)
-    # segment_by_section("./data/格力电器2022年年度报告.pdf", "data")
-
-    elements = extract_section_elements("./data/第二节公司简介和主要财务指标.pdf")
-    lines = []
+def pdf2html(pdf_file, save_file):
+    elements = extract_pdf_elements(pdf_file)
+    with open("pdf.html", encoding="utf-8") as fi:
+        html = fi.read()
+    content = ""
     for element in elements:
         if "text" in element:
-            print(element["text"])
+            content += f"<p>{element['text']}</p>\n"
         elif "image" in element:
-            print("image")
+            uri = base64.b64encode(element["image"]).decode("utf-8")
+            content += f'<div align="center"><img src="data:image/jpeg;base64,{uri}"></div>'
         else:
-            print("table")
+            if "head_note" in element:
+                content += f'<div class="head-note"><span>{element["head_note"]}</span></div>'
+            table = element["table"]
+            content += table.df.to_html(header=False, index=False).replace("\\n", "")
+            content += "<br/>"
+    html = html.replace("{{content}}", content)
+    with open(save_file, "w", encoding="utf-8") as fo:
+        fo.write(html)
 
-    # paras = segment_paragraph(lines)
-    # for para in paras:
-    #     print(para + "\n\n")
 
-    # pdf = PdfReader("./data/格力电器2022年年度报告.pdf")
-    # print(pdf.pages[5].extract_text())
+if __name__ == "__main__":
+    # segment_by_section("./data/shangji/上海机场上海机场2022年年度报告.pdf", "data/shangji")
+
+    pdf2html("./data/第二节公司简介和主要财务指标.pdf", "page.html")
+
+    # tables = camelot.read_pdf("./data/第二节公司简介和主要财务指标.pdf", pages="4", line_scale=35)
+    # print(tables)
+    # print(tables[-1])
+    # print(tables[0].df)
+    # for table in tables:
+    #     print(table._bbox)
+    # print(table.df.to_html(header=False, index=False))
