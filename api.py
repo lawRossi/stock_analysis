@@ -50,7 +50,6 @@ def get_company_info(stock_code):
 
 def get_stock_info(stock_name_or_code):
     res = requests.get(f"https://searchapi.eastmoney.com/api/suggest/get?input={stock_name_or_code}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8").json()
-    print(res)
 
     if "QuotationCodeTable" in res:
         data = res["QuotationCodeTable"]["Data"][0]
@@ -152,7 +151,11 @@ def get_annual_report(stock_code, n):
             logger.warning(f"fail to get notices for {stock_code}, page {i}")
 
 
-def download_annual_reports(stock_code, save_dir, n):
+def download_annual_reports(stock_code_or_name, save_dir, n):
+    if not re.compile("^\d+$").match(stock_code_or_name):
+        stock_code = get_stock_info(stock_code_or_name)["stock_code"]
+    else:
+        stock_code = stock_code_or_name
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     downloaded = 0
@@ -356,6 +359,8 @@ if __name__ == "__main__":
     # download_annual_reports("600519", "data", 2)
     # download_financial_reports("600519", "data/financial_report")
 
-    stock_zygc_em_df = ak.stock_zygc_ym(symbol="600009")
+    # stock_zygc_em_df = ak.stock_zygc_ym(symbol="600009")
     # stock_zygc_em_df = ak.stock_zyjs_ths(symbol="SH600009")
-    stock_zygc_em_df.to_excel("temp.xlsx", index=False)
+    # stock_zygc_em_df.to_excel("temp.xlsx", index=False)
+
+    download_annual_reports("", "data", 1)

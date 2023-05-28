@@ -1,4 +1,6 @@
 import base64
+from collections import Counter
+import math
 import os
 import re
 
@@ -14,43 +16,74 @@ from pypdf import PdfReader, PdfWriter
 section_title = re.compile(r"(?P<section_name>第\s*(\d+|[一二三四五六七八九十]+)\s*节.+)")
 
 
-def find_toc_page(pdf_file):
+def parse_toc(pdf_file):
     pdf = pdfplumber.open(pdf_file)
     toc_pattern = re.compile(r"^目\s*录$")
+    toc_page = None
     for i in range(10):
         page = pdf.pages[i]
         text = page.extract_text().strip()
         lines = text.split("\n")
         for line in lines[:5]:
             if toc_pattern.match(line.strip()):
-                return i
-    return None
+                toc_page = page
+                break
+        if toc_page:
+            break
+    if not toc_page:
+        logger.warning("toc page not found")
+        return []
+
+    p1 = re.compile(r"(?P<section_title>^[^\d]+?\s*[^.]*)[.]+\s*\d+$")
+    p2 = re.compile(r"^\d+\s+(?P<section_title>[^\d]+)$")
+    pattern = None
+    section_titles = []
+    for line in page.extract_text().strip().split("\n"):
+        line = line.strip()
+        if pattern is None:
+            if p1.match(line):
+                pattern = p1
+            elif p2.match(line):
+                pattern = p2
+        if pattern:
+            match = pattern.match(line)
+            if match:
+                title = match.group("section_title")
+                section_titles.append(title.strip().replace(" ", ""))
+
+    return section_titles
 
 
-def segment_by_section(pdf_file, save_dir=None):
-    toc_idx = find_toc_page(pdf_file)
-    if toc_idx is None:
-        logger.warning("toc not found")
-        return
-
-    pdf = PdfReader(pdf_file)
-    sections = {}
+def segment_by_section(pdf_file, section_titles, save_dir=None):
+    idx = 0
     start = None
     section = None
-    for i in range(toc_idx+1, len(pdf.pages)):
-        page = pdf.pages[i]
+    sections = {}
+    serial_pattern = re.compile("第[一二三四五六七八九十]+[节章]")
+    extra_pattern = re.compile(r"[(（].+[)）]$")
+    pdf = pdfplumber.open(pdf_file)
+    for i, page in enumerate(pdf.pages):
         for line in page.extract_text().strip().split("\n"):
-            match = section_title.search(line.strip())
-            if match:
+            line = line.strip().replace(" ", "")
+            line = extra_pattern.sub("", line)
+            title = section_titles[idx]
+            clean_title = serial_pattern.sub("", title)
+            clean_title = extra_pattern.sub("", clean_title)
+            if line == title or clean_title == line:
                 if start is not None:
-                    sections[section.strip()] = (start, i)
+                    sections[section_titles[idx-1]] = (start, i)
                 start = i
-                section = match.group("section_name")
-    if section:
-        sections[section.strip()] = (start, len(pdf.pages)-1)
+                idx += 1
+                if idx == len(section_titles):
+                    break
+        if idx == len(section_titles):
+            break
+    if start:
+        sections[section_titles[-1]] = (start, len(pdf.pages)-1)
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
+        pdf = PdfReader(pdf_file)
         for section, (start, end) in sections.items():
             writer = PdfWriter()
             for i in range(start, end+1):
@@ -58,24 +91,27 @@ def segment_by_section(pdf_file, save_dir=None):
             file_name = section.replace(" ", "")
             writer.write(f"{save_dir}/{file_name}.pdf")
 
-    return sections
 
-
-def extract_sections(report_file, section_titles, save_path):
-    sections = segment_by_section(report_file)
-    pages = set()
-    for section, page_range in sections.items():
-        if any(title in section for title in section_titles):
-            for page in range(page_range[0], page_range[1]+1):
-                pages.add(page)
-
-    pdf = PdfReader(report_file)
-    pdf_writer = PdfWriter()
-    for page in sorted(pages):
-        pdf_writer.add_page(pdf.pages[page])
-
-    with open(save_path, "wb") as fo:
-        pdf_writer.write(fo)
+def seperate_financial_report(pdf_file, save_dir):
+    reader = PdfReader(pdf_file)
+    writer = PdfWriter()
+    idx = 0
+    done = False
+    while idx < len(reader.pages):
+        for line in reader.pages[idx].extract_text().strip().split("\n"):
+            if any(line.strip().endswith(suffix) for suffix in ["公司基本情况", "集团基本情况"]):
+                writer.write(f"{save_dir}/财务报告.pdf")
+                writer = PdfWriter()
+                for i in range(idx, len(reader.pages)):
+                    writer.add_page(reader.pages[i])
+                writer.write(f"{save_dir}/财务报表附注.pdf")
+                done = True
+                break
+        else:
+            writer.add_page(reader.pages[idx])
+            idx += 1
+        if done:
+            break
 
 
 def get_sorted_lines(page):
@@ -84,20 +120,62 @@ def get_sorted_lines(page):
         if isinstance(element, LTTextContainer):
             for text_line in element:
                 if isinstance(text_line, LTTextLineHorizontal):
-                    lines.append((text_line, text_line.bbox[3]))
-    lines = [item[0] for item in sorted(lines, key=lambda x: x[1], reverse=True)]
+                    lines.append(text_line)
+    lines = [line for line in sorted(lines, key=lambda x: x.bbox[3], reverse=True)]
 
     return lines
 
 
-def extract_head_foot_note(pdf_file, head_lines=1, foot_lines=1):
-    pages = extract_pages(pdf_file)
-    page = next(pages)
-    lines = get_sorted_lines(page)
-    width, height = page.bbox[2], page.bbox[3]
-    top = lines[head_lines-1].bbox[1]
-    bottom = lines[-foot_lines].bbox[-1]
-    return [(0, 0, width, bottom), (0, top, width, height)]
+def get_most_common(positions):
+    if not positions:
+        return 0, 0
+    counts = Counter(positions)
+    top2 = counts.most_common(2)
+    if len(top2) == 1:
+        return top2[0]
+    else:
+        if abs(top2[0][0] - top2[1][0]) == 1:
+            count = top2[0][1] + top2[1][1]
+        else:
+            count = top2[0][1]
+        return top2[0][0], count
+
+
+def extract_head_foot_note(pdf_file):
+    tops = []
+    bottoms = []
+    for i, page in enumerate(extract_pages(pdf_file)):
+        height = page.bbox[3]
+        lines = get_sorted_lines(page)
+        for j in range(len(lines)-1):
+            margin = lines[j].bbox[1] - lines[j+1].bbox[3]
+            if margin > 20:
+                tops.append(math.floor(height - lines[j].bbox[1]))
+                break
+        for j in range(len(lines)-1, 0, -1):
+            margin = lines[j-1].bbox[1] - lines[j].bbox[3]
+            if margin > 25:
+                bottoms.append(math.ceil(lines[j].bbox[3]))
+                break
+        if i == 10:
+            break
+    top, count = get_most_common(tops)
+    if count < 5:
+        top = None
+    bottom, count = get_most_common(bottoms)
+    if count < 5:
+        bottom = None
+    return top, bottom
+
+
+# def extract_head_foot_note(pdf_file, head_lines=1, foot_lines=1):
+#     pages = extract_pages(pdf_file)
+#     page = next(pages)
+#     lines = get_sorted_lines(page)
+#     width, height = page.bbox[2], page.bbox[3]
+#     top = lines[head_lines-1].bbox[1]
+#     bottom = lines[-foot_lines].bbox[-1]
+#     return [(0, 0, width, bottom), (0, top, width, height)]
 
 
 def curves_to_edges(cs):
@@ -216,14 +294,18 @@ def extract_lines_not_within_bboxes(page, bboxes):
     return lines
 
 
-def extract_page_elements(pdf_file, page_idx):
+def extract_page_elements(pdf_file, page_idx, top, bottom):
     pages = extract_pages(pdf_file, page_numbers=[page_idx])
     page = next(pages)
     height = page.bbox[3]
     tables = extract_tables(pdf_file, page_idx)
     images = extract_images(pdf_file, page_idx)
     elements = [(table, table._bbox) for table in tables] + [(image, convert_bbox(image["bbox"], height)) for image in images]
-    bboxes = extract_head_foot_note(pdf_file)
+    bboxes = []
+    if top is not None:
+        bboxes.append((0, page.bbox[3]-top, page.bbox[2], page.bbox[3]))
+    if bottom is not None:
+        bboxes.append((0, 0, page.bbox[2], bottom))
     bboxes.extend([element[1] for element in elements])
     lines = extract_lines_not_within_bboxes(page, bboxes)
     elements.extend((line, line.bbox) for line in lines)
@@ -247,8 +329,8 @@ def str2number(num_str):
     return char2digit.get(match.group("bai"), 0) * 100 + char2digit.get(match.group("shi"), 0) * 10 + char2digit.get(match.group("ge"), 0)
 
 
-serial_numbers = [r"(?P<number>[一二三四五六七八九十]+)([、.]|\s).+", r"(?P<number>\d+)\.[^\d]+", r"\((?P<number>[一二三四五六七八九十]+)\).+",
-                  r"[(]?(?P<number>\d+)\)[.|\s].+", r"(?P<number>\d+)、.+"]
+serial_numbers = [r"(?P<number>[一二三四五六七八九十]+)([、.]|\s).+", r"(?P<number>\d+)\.[^\d]+", r"[(（](?P<number>[一二三四五六七八九十]+)[)）].+",
+                  r"[(（]?(?P<number>\d+)[)）][.|\s].+", r"(?P<number>\d+)、.+"]
 patterns = [re.compile(item) for item in serial_numbers]
 
 
@@ -324,11 +406,16 @@ def segment_paragraph(lines):
         text = line.get_text().strip()
         if i > 0:
             indent = line.bbox[0] - lines[i-1].bbox[0]
-        if indent is not None and indent > 20:
+        if indent is not None and indent > 15:
             if para:
                 paragraphs.append(para)
-            para = text
-            prev_len = length
+            if length < max_len * 0.9:
+                paragraphs.append(text)
+                para = ""
+                prev_len = None
+            else:
+                para = text
+                prev_len = length
         elif prev_len is not None:
             if any(pattern.match(text) for pattern in patterns):
                 paragraphs.append(para)
@@ -386,9 +473,14 @@ def extract_pdf_elements(pdf_file):
     page_num = len(pdf.pages)
     pdf.close()
     pages = []
+    top, bottom = extract_head_foot_note(pdf_file)
+    logger.info("start to extract page elements")
     for i in range(page_num):
-        elements = extract_page_elements(pdf_file, i)
+        elements = extract_page_elements(pdf_file, i, top, bottom)
         pages.append(elements)
+        if (i + 1) % 5 == 0:
+            logger.info(f"{i+1} pages processed")
+
     if len(pages) > 1:
         for i, element in enumerate(pages[-1]):
             if isinstance(element, LTTextLineHorizontal):
@@ -454,9 +546,37 @@ def pdf2html(pdf_file, save_file):
 
 
 if __name__ == "__main__":
-    # segment_by_section("./data/shangji/上海机场上海机场2022年年度报告.pdf", "data/shangji")
+    # pdf = pdfplumber.open("./data/招商银行招商银行股份有限公司2022年度报告.pdf")
+    # print(pdf.pages[76].extract_text())
+    # for page in extract_pages("./data/中国平安中国平安2022年年度报告.pdf", page_numbers=[3]):
+    #     for line in get_sorted_lines(page):
+    #         print(line.get_text())
 
-    pdf2html("./data/第二节公司简介和主要财务指标.pdf", "page.html")
+    # titles = parse_toc("data/招商银行招商银行股份有限公司2022年度报告.pdf")
+    # segment_by_section("data/招商银行招商银行股份有限公司2022年度报告.pdf", titles, "data/zhaohang")
+
+    # titles = parse_toc("data/上海机场上海机场2022年年度报告.pdf")
+    # segment_by_section("data/上海机场上海机场2022年年度报告.pdf", titles, "data/shangji")
+
+    # titles = parse_toc("data/格力电器2022年年度报告.pdf")
+    # segment_by_section("data/格力电器2022年年度报告.pdf", titles, "data/geli")
+
+    # segment_by_section("data/中国平安中国平安2022年年度报告.pdf", ["释义", "客户经营分析", "公司治理报告", "审计报告", "平安大事记"], "data/pingan")
+
+    # for file in os.listdir("data"):
+    #     if file.endswith(".pdf"):
+    #         print(file)
+    #         save_dir = f"data/{file[:4]}"
+    #         os.makedirs(save_dir, exist_ok=True)
+    #         segment_by_section(f"./data/{file}", save_dir)
+    # seperate_financial_report("data/第十节财务报告.pdf", "data")
+
+    # for file in os.listdir("data"):
+    #     file = file.lower()
+    #     if file.startswith("第") and file.endswith(".pdf") and "财务" not in file:
+    #         print(file)
+    #         save_file = file.replace(".pdf", ".html")
+    #         pdf2html(f"./data/{file}", f"data/{save_file}")
 
     # tables = camelot.read_pdf("./data/第二节公司简介和主要财务指标.pdf", pages="4", line_scale=35)
     # print(tables)
@@ -465,3 +585,28 @@ if __name__ == "__main__":
     # for table in tables:
     #     print(table._bbox)
     # print(table.df.to_html(header=False, index=False))
+
+    # reader = PdfReader("./data/第三节管理层讨论与分析.pdf")
+    # writer = PdfWriter()
+    # writer.add_page(reader.pages[4])
+    # writer.write("temp.pdf")
+
+    # prev = None
+    # for page in extract_pages("temp.pdf"):
+    #     for element in page:
+    #         if isinstance(element, LTTextContainer):
+    #             for line in element:
+    #                 if isinstance(line, LTTextLineHorizontal):
+    #                     if prev is not None:
+    #                         indent = line.bbox[0] - prev.bbox[0]
+    #                         if indent > 1:
+    #                             print(line.get_text().strip(), indent, line.bbox[2])
+    #                     prev = line
+
+    # print(extract_head_foot_note("data/贵州茅台贵州茅台2022年年度报告.pdf"))
+    # print(extract_head_foot_note("data/招商银行招商银行股份有限公司2022年度报告.pdf"))
+    # print(extract_head_foot_note("data/中国平安中国平安2022年年度报告.pdf"))
+    # print(extract_head_foot_note("data/上海机场上海机场2022年年度报告.pdf"))
+    # print(extract_head_foot_note("data/分众传媒2022年年度报告.pdf"))
+
+    pdf2html("data/geli/第三节管理层讨论与分析.pdf", "data/geli/taolun.html")
