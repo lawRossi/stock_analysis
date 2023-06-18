@@ -268,8 +268,8 @@ def extract_images(pdf_file, page_idx):
     return images
 
 
-def extract_tables(pdf_file, page_idx):
-    tables = camelot.read_pdf(pdf_file, pages=f"{page_idx+1}", line_scale=35)
+def extract_tables(pdf_file, page_idx, kwargs={}):
+    tables = camelot.read_pdf(pdf_file, pages=f"{page_idx+1}", **kwargs)
 
     return tables
 
@@ -294,11 +294,11 @@ def extract_lines_not_within_bboxes(page, bboxes):
     return lines
 
 
-def extract_page_elements(pdf_file, page_idx, top, bottom):
+def extract_page_elements(pdf_file, page_idx, top, bottom, table_settings={}):
     pages = extract_pages(pdf_file, page_numbers=[page_idx])
     page = next(pages)
     height = page.bbox[3]
-    tables = extract_tables(pdf_file, page_idx)
+    tables = extract_tables(pdf_file, page_idx, table_settings)
     images = extract_images(pdf_file, page_idx)
     elements = [(table, table._bbox) for table in tables] + [(image, convert_bbox(image["bbox"], height)) for image in images]
     bboxes = []
@@ -450,37 +450,34 @@ def segment_paragraph(lines):
 def arrange_elements(elements):
     lines = [element["line"] for element in elements if "line" in element]
     paragraphs = segment_paragraph(lines)
-    i = -1
+    para_idx = -1
+    offset = 0
     new_elements = []
     for element in elements:
         if "line" in element:
-            if i == -1:
-                i += 1
-                new_elements.append({"text": paragraphs[i]})
+            if para_idx == -1:
+                para_idx += 1
+                new_elements.append({"text": paragraphs[para_idx]})
+                continue
             text = element["line"].get_text().strip()
-            if text not in paragraphs[i]:
-                i += 1
-                assert text in paragraphs[i]
-                new_elements.append({"text": paragraphs[i]})
+            paragraph = paragraphs[para_idx]
+            idx = paragraph.find(text, offset)
+            if idx == -1:
+                para_idx += 1
+                paragraph = paragraphs[para_idx]
+                idx = paragraph.find(text)
+                assert idx > -1
+                new_elements.append({"text": paragraph})
+                offset = idx + len(text)
+            else:
+                offset = idx + len(text)
         else:
             new_elements.append(element)
 
     return new_elements
 
 
-def extract_pdf_elements(pdf_file):
-    pdf = pdfplumber.open(pdf_file)
-    page_num = len(pdf.pages)
-    pdf.close()
-    pages = []
-    top, bottom = extract_head_foot_note(pdf_file)
-    logger.info("start to extract page elements")
-    for i in range(page_num):
-        elements = extract_page_elements(pdf_file, i, top, bottom)
-        pages.append(elements)
-        if (i + 1) % 5 == 0:
-            logger.info(f"{i+1} pages processed")
-
+def trim_extra_content(pages):
     if len(pages) > 1:
         for i, element in enumerate(pages[-1]):
             if isinstance(element, LTTextLineHorizontal):
@@ -495,6 +492,23 @@ def extract_pdf_elements(pdf_file):
                 if section_title.search(element.get_text()):
                     pages[0] = pages[0][:i]
                     break
+
+
+def extract_pdf_elements(pdf_file, table_settings={}):
+    pdf = pdfplumber.open(pdf_file)
+    page_num = len(pdf.pages)
+    pdf.close()
+    pages = []
+    top, bottom = extract_head_foot_note(pdf_file)
+    logger.info("start to extract page elements")
+    for i in range(page_num):
+        elements = extract_page_elements(pdf_file, i, top, bottom, table_settings)
+        pages.append(elements)
+        if (i + 1) % 5 == 0:
+            logger.info(f"{i+1} pages processed")
+
+    trim_extra_content(pages)
+
     all_elements = []
     for page in pages:
         for i, element in enumerate(page):
@@ -523,8 +537,8 @@ def extract_pdf_elements(pdf_file):
     return elements
 
 
-def pdf2html(pdf_file, save_file):
-    elements = extract_pdf_elements(pdf_file)
+def pdf2html(pdf_file, save_file, table_settings={}):
+    elements = extract_pdf_elements(pdf_file, table_settings)
     with open("pdf.html", encoding="utf-8") as fi:
         html = fi.read()
     content = ""
@@ -538,7 +552,7 @@ def pdf2html(pdf_file, save_file):
             if "head_note" in element:
                 content += f'<div class="head-note"><span>{element["head_note"]}</span></div>'
             table = element["table"]
-            content += table.df.to_html(header=False, index=False).replace("\\n", "")
+            content += '<div class="table-container">' + table.df.to_html(header=False, index=False).replace("\\n", "") + '</div>'
             content += "<br/>"
     html = html.replace("{{content}}", content)
     with open(save_file, "w", encoding="utf-8") as fo:
@@ -609,4 +623,13 @@ if __name__ == "__main__":
     # print(extract_head_foot_note("data/上海机场上海机场2022年年度报告.pdf"))
     # print(extract_head_foot_note("data/分众传媒2022年年度报告.pdf"))
 
-    pdf2html("data/geli/第三节管理层讨论与分析.pdf", "data/geli/taolun.html")
+    # pdf2html("data/geli/第一节重要提示、目录和释义.pdf", "data/geli/shiyi.html")
+    # pdf2html("data/geli/第二节公司简介和主要财务指标.pdf", "data/geli/jianjie.html")
+    # pdf2html("data/geli/第三节管理层讨论与分析.pdf", "data/geli/taolun.html")
+    # pdf2html("data/geli/第四节公司治理.pdf", "data/geli/zhili.html")
+    # pdf2html("data/geli/第五节环境和社会责任.pdf", "data/geli/zeren.html")
+    # pdf2html("data/geli/第六节重要事项.pdf", "data/geli/shixiang.html")
+    # pdf2html("data/geli/第七节股份变动及股东情况.pdf", "data/geli/biandong.html")
+    # table_settings = {"line_scale": 35, "strip_text": " \n"}
+    table_settings = {"flavor": "stream", "row_tol": 10, "edge_tol": 250}
+    pdf2html("data/geli/第十节财务报告.pdf", "data/geli/caiwu.html", table_settings)
