@@ -7,6 +7,7 @@ import re
 import camelot
 import fitz
 from loguru import logger
+import pandas as pd
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer, LTTextLineHorizontal
 import pdfplumber
@@ -168,52 +169,6 @@ def extract_head_foot_note(pdf_file):
     return top, bottom
 
 
-# def extract_head_foot_note(pdf_file, head_lines=1, foot_lines=1):
-#     pages = extract_pages(pdf_file)
-#     page = next(pages)
-#     lines = get_sorted_lines(page)
-#     width, height = page.bbox[2], page.bbox[3]
-#     top = lines[head_lines-1].bbox[1]
-#     bottom = lines[-foot_lines].bbox[-1]
-#     return [(0, 0, width, bottom), (0, top, width, height)]
-
-
-def curves_to_edges(cs):
-    """See https://github.com/jsvine/pdfplumber/issues/127"""
-    edges = []
-    for c in cs:
-        edges += pdfplumber.utils.rect_to_edges(c)
-    return edges
-
-
-def extract_text_without_table_content(pdf, page_index):
-    page = pdf.pages[page_index]
-    # Table settings.
-    ts = {
-        "vertical_strategy": "explicit",
-        "horizontal_strategy": "explicit",
-        "explicit_vertical_lines": curves_to_edges(page.curves + page.edges),
-        "explicit_horizontal_lines": curves_to_edges(page.curves + page.edges),
-        "intersection_y_tolerance": 10,
-    }
-
-    bboxes = [table.bbox for table in page.find_tables(table_settings=ts)]
-
-    def not_within_bboxes(obj):
-        top = page.chars[0]["bottom"]
-        bottom = page.chars[-1]["top"]
-
-        def obj_in_bbox(_bbox):
-            """See https://github.com/jsvine/pdfplumber/blob/stable/pdfplumber/table.py#L404"""
-            v_mid = (obj["top"] + obj["bottom"]) / 2
-            h_mid = (obj["x0"] + obj["x1"]) / 2
-            x0, top, x1, bottom = _bbox
-            return (h_mid >= x0) and (h_mid < x1) and (v_mid >= top) and (v_mid < bottom)
-        return obj["top"] >= top and obj["bottom"] <= bottom and not any(obj_in_bbox(__bbox) for __bbox in bboxes)
-
-    return page.filter(not_within_bboxes).extract_text()
-
-
 def recoverpix(doc, item):
     xref = item[0]  # xref of PDF image
     smask = item[1]  # xref of its /SMask
@@ -268,8 +223,30 @@ def extract_images(pdf_file, page_idx):
     return images
 
 
+class Table:
+    def __init__(self):
+        self.bbox = None
+        self.df = None
+
+
 def extract_tables(pdf_file, page_idx, kwargs={}):
-    tables = camelot.read_pdf(pdf_file, pages=f"{page_idx+1}", **kwargs)
+    tables = []
+    engine = kwargs["engine"]
+    kwargs_ = {k: v for k, v in kwargs.items() if k != "engine"}
+    if engine == "camelot":
+        for raw_table in camelot.read_pdf(pdf_file, pages=f"{page_idx+1}", **kwargs_):
+            table = Table()
+            table.bbox = raw_table._bbox
+            table.df = raw_table.df
+            tables.append(table)
+    elif engine == "pdfplumber":
+        pdf = pdfplumber.open(pdf_file)
+        page = pdf.pages[page_idx]
+        for raw_table in page.find_tables(**kwargs_):
+            table = Table()
+            table.bbox = convert_bbox(raw_table.bbox, page.height)
+            table.df = pd.DataFrame(raw_table.extract()).fillna("")
+            tables.append(table)
 
     return tables
 
@@ -315,6 +292,80 @@ def extract_page_elements(pdf_file, page_idx, top, bottom, table_settings={}):
     return elements
 
 
+def extract_all_images(pdf_file):
+    pdf = fitz.open(pdf_file)
+    all_images = []
+    for i in range(len(pdf)):
+        page = pdf[i]
+        image_list = pdf.get_page_images(i, full=True)
+        images = []
+        for image in image_list:
+            bbox = page.get_image_bbox(image)
+            image = recoverpix(pdf, image)
+            image["bbox"] = bbox
+            images.append(image)
+        all_images.append(images)
+
+    return all_images
+
+
+def get_page_number(pdf_file):
+    with open(pdf_file, "rb") as fi:
+        pdf = PdfReader(fi)
+        return len(pdf.pages)
+
+
+def extract_all_tables(pdf_file, kwargs):
+    engine = kwargs["engine"]
+    kwargs_ = {k: v for k, v in kwargs.items() if k != "engine"}
+
+    if engine == "camelot":
+        page_num = get_page_number(pdf_file)
+        all_tables = [[] for _ in range(page_num)]
+        for raw_table in camelot.read_pdf(pdf_file, pages="all", **kwargs_):
+            table = Table()
+            table.bbox = raw_table._bbox
+            table.df = raw_table.df
+            all_tables[raw_table.parsing_report["page"]-1].append(table)
+
+    elif engine == "pdfplumber":
+        pdf = pdfplumber.open(pdf_file)
+        all_tables = []
+        for page in pdf.pages:
+            tables = []
+            for raw_table in page.find_tables(**kwargs_):
+                table = Table()
+                table.bbox = convert_bbox(raw_table.bbox, page.height)
+                table.df = pd.DataFrame(raw_table.extract()).fillna("")
+                tables.append(table)
+            all_tables.append(tables)
+
+    return all_tables
+
+
+def extract_all_page_elements(pdf_file, top, bottom, table_settings={}):
+    pages = extract_pages(pdf_file)
+    all_images = extract_all_images(pdf_file)
+    all_tables = extract_all_tables(pdf_file, table_settings)
+    all_elements = []
+    for page, images, tables in zip(pages, all_images, all_tables):
+        height = page.bbox[3]
+        elements = [(table, table.bbox) for table in tables] + [(image, convert_bbox(image["bbox"], height)) for image in images]
+        bboxes = []
+        if top is not None:
+            bboxes.append((0, page.bbox[3]-top, page.bbox[2], page.bbox[3]))
+        if bottom is not None:
+            bboxes.append((0, 0, page.bbox[2], bottom))
+        bboxes.extend([element[1] for element in elements])
+        lines = extract_lines_not_within_bboxes(page, bboxes)
+        elements.extend((line, line.bbox) for line in lines)
+        elements = sorted(elements, key=lambda x: x[1][3], reverse=True)
+        elements = [element[0] for element in elements]
+        all_elements.append(elements)
+
+    return all_elements
+
+
 char2digit = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "零": 0,
               "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5, "陆": 6, "柒": 7, "捌": 8, "玖": 9, "两": 2,
               "": 1}
@@ -330,7 +381,7 @@ def str2number(num_str):
 
 
 serial_numbers = [r"(?P<number>[一二三四五六七八九十]+)([、.]|\s).+", r"(?P<number>\d+)\.[^\d]+", r"[(（](?P<number>[一二三四五六七八九十]+)[)）].+",
-                  r"[(（]?(?P<number>\d+)[)）][.|\s].+", r"(?P<number>\d+)、.+"]
+                  r"[(（]?(?P<number>\d+)[)）][.|\s]?.+", r"(?P<number>\d+)、.+"]
 patterns = [re.compile(item) for item in serial_numbers]
 
 
@@ -401,9 +452,12 @@ def segment_paragraph(lines):
     prev_len = None
     indent = None
     max_len = max(line.bbox[2] - line.bbox[0] for line in lines)
+    max_len = min(460, max_len)
     for i, line in enumerate(lines):
         length = line.bbox[2] - line.bbox[0]
         text = line.get_text().strip()
+        if not text:
+            continue
         if i > 0:
             indent = line.bbox[0] - lines[i-1].bbox[0]
         if indent is not None and indent > 15:
@@ -416,17 +470,18 @@ def segment_paragraph(lines):
             else:
                 para = text
                 prev_len = length
-        elif prev_len is not None:
-            if any(pattern.match(text) for pattern in patterns):
+        elif any(pattern.match(text) for pattern in patterns):
+            if para:
                 paragraphs.append(para)
-                if length < max_len * 0.9:
-                    paragraphs.append(text)
-                    prev_len = None
-                    para = ""
-                else:
-                    prev_len = length
-                    para = text
-            elif length < 0.9 * prev_len:
+            if length < max_len * 0.9:
+                paragraphs.append(text)
+                prev_len = None
+                para = ""
+            else:
+                prev_len = length
+                para = text
+        elif prev_len is not None:
+            if length < 0.9 * prev_len:
                 para += text
                 paragraphs.append(para)
                 para = ""
@@ -495,18 +550,10 @@ def trim_extra_content(pages):
 
 
 def extract_pdf_elements(pdf_file, table_settings={}):
-    pdf = pdfplumber.open(pdf_file)
-    page_num = len(pdf.pages)
-    pdf.close()
     pages = []
     top, bottom = extract_head_foot_note(pdf_file)
     logger.info("start to extract page elements")
-    for i in range(page_num):
-        elements = extract_page_elements(pdf_file, i, top, bottom, table_settings)
-        pages.append(elements)
-        if (i + 1) % 5 == 0:
-            logger.info(f"{i+1} pages processed")
-
+    pages = extract_all_page_elements(pdf_file, top, bottom, table_settings)
     trim_extra_content(pages)
 
     all_elements = []
@@ -560,30 +607,8 @@ def pdf2html(pdf_file, save_file, table_settings={}):
 
 
 if __name__ == "__main__":
-    # pdf = pdfplumber.open("./data/招商银行招商银行股份有限公司2022年度报告.pdf")
-    # print(pdf.pages[76].extract_text())
-    # for page in extract_pages("./data/中国平安中国平安2022年年度报告.pdf", page_numbers=[3]):
-    #     for line in get_sorted_lines(page):
-    #         print(line.get_text())
-
     # titles = parse_toc("data/招商银行招商银行股份有限公司2022年度报告.pdf")
     # segment_by_section("data/招商银行招商银行股份有限公司2022年度报告.pdf", titles, "data/zhaohang")
-
-    # titles = parse_toc("data/上海机场上海机场2022年年度报告.pdf")
-    # segment_by_section("data/上海机场上海机场2022年年度报告.pdf", titles, "data/shangji")
-
-    # titles = parse_toc("data/格力电器2022年年度报告.pdf")
-    # segment_by_section("data/格力电器2022年年度报告.pdf", titles, "data/geli")
-
-    # segment_by_section("data/中国平安中国平安2022年年度报告.pdf", ["释义", "客户经营分析", "公司治理报告", "审计报告", "平安大事记"], "data/pingan")
-
-    # for file in os.listdir("data"):
-    #     if file.endswith(".pdf"):
-    #         print(file)
-    #         save_dir = f"data/{file[:4]}"
-    #         os.makedirs(save_dir, exist_ok=True)
-    #         segment_by_section(f"./data/{file}", save_dir)
-    # seperate_financial_report("data/第十节财务报告.pdf", "data")
 
     # for file in os.listdir("data"):
     #     file = file.lower()
@@ -592,44 +617,4 @@ if __name__ == "__main__":
     #         save_file = file.replace(".pdf", ".html")
     #         pdf2html(f"./data/{file}", f"data/{save_file}")
 
-    # tables = camelot.read_pdf("./data/第二节公司简介和主要财务指标.pdf", pages="4", line_scale=35)
-    # print(tables)
-    # print(tables[-1])
-    # print(tables[0].df)
-    # for table in tables:
-    #     print(table._bbox)
-    # print(table.df.to_html(header=False, index=False))
-
-    # reader = PdfReader("./data/第三节管理层讨论与分析.pdf")
-    # writer = PdfWriter()
-    # writer.add_page(reader.pages[4])
-    # writer.write("temp.pdf")
-
-    # prev = None
-    # for page in extract_pages("temp.pdf"):
-    #     for element in page:
-    #         if isinstance(element, LTTextContainer):
-    #             for line in element:
-    #                 if isinstance(line, LTTextLineHorizontal):
-    #                     if prev is not None:
-    #                         indent = line.bbox[0] - prev.bbox[0]
-    #                         if indent > 1:
-    #                             print(line.get_text().strip(), indent, line.bbox[2])
-    #                     prev = line
-
-    # print(extract_head_foot_note("data/贵州茅台贵州茅台2022年年度报告.pdf"))
-    # print(extract_head_foot_note("data/招商银行招商银行股份有限公司2022年度报告.pdf"))
-    # print(extract_head_foot_note("data/中国平安中国平安2022年年度报告.pdf"))
-    # print(extract_head_foot_note("data/上海机场上海机场2022年年度报告.pdf"))
-    # print(extract_head_foot_note("data/分众传媒2022年年度报告.pdf"))
-
-    # pdf2html("data/geli/第一节重要提示、目录和释义.pdf", "data/geli/shiyi.html")
-    # pdf2html("data/geli/第二节公司简介和主要财务指标.pdf", "data/geli/jianjie.html")
-    # pdf2html("data/geli/第三节管理层讨论与分析.pdf", "data/geli/taolun.html")
-    # pdf2html("data/geli/第四节公司治理.pdf", "data/geli/zhili.html")
-    # pdf2html("data/geli/第五节环境和社会责任.pdf", "data/geli/zeren.html")
-    # pdf2html("data/geli/第六节重要事项.pdf", "data/geli/shixiang.html")
-    # pdf2html("data/geli/第七节股份变动及股东情况.pdf", "data/geli/biandong.html")
-    # table_settings = {"line_scale": 35, "strip_text": " \n"}
-    table_settings = {"flavor": "stream", "row_tol": 10, "edge_tol": 250}
-    pdf2html("data/geli/第十节财务报告.pdf", "data/geli/caiwu.html", table_settings)
+    pdf2html("./data/geli/第三节管理层讨论与分析.pdf", "data/geli.html", {"engine": "pdfplumber"})
