@@ -686,7 +686,7 @@ def parse_segment(segment, config=None):
         line = segment[0].get_text().strip()
         for pattern in patterns:
             if pattern.match(line):
-                title = line
+                title = segment[0]
                 break
     if not title:
         segments = segment_elements(segment, config)
@@ -728,6 +728,11 @@ def refine_document(document):
     parts = document["parts"]
     parts = [refine_document(part) for part in parts]
     if document["content"] is None:
+        if all(only_title(part) for part in parts):
+            content = [part["title"] for part in parts]
+            document["content"] = content
+            return document
+
         if document["title"] is None:
             if len(parts) == 1:
                 document["title"] = parts[0]["title"]
@@ -755,7 +760,13 @@ def only_parts(document):
     return document["content"] is None and document["title"] is None
 
 
+def only_title(document):
+    return document["content"] is None and not document["parts"]
+
+
 def convert_document(document):
+    if document["title"]:
+        document["title"] = document["title"].get_text().strip()
     if document["content"]:
         document["content"] = "".join(item.get_text() for item in document["content"] if isinstance(item, LTTextLineHorizontal))
     if document["parts"]:
@@ -791,7 +802,7 @@ if __name__ == "__main__":
 
     import json
 
-    pdf_file = "./data/geli/4.pdf"
+    pdf_file = "data/yili/第三节管理层讨论与分析.pdf"
     ts = {"engine": "camelot"}
     top, bottom = extract_head_foot_note(pdf_file)
     logger.info("start to extract page elements")
@@ -804,7 +815,7 @@ if __name__ == "__main__":
     segments = segment_elements(elements, config)
     print(len(segments))
     for i, segment in enumerate(segments):
-        with open(f"segment{i}.txt", "w", encoding="utf-8") as fo:
+        with open(f"data/segment{i}.txt", "w", encoding="utf-8") as fo:
             config = { #"explicit_seperators": {"报告期内主要经营情况": ["经营计划执行情况", "主营业务分析"]},
                     "exceptional_titles": ["坚守“伊利即品质”信条，为消费者提供安全、健康、高品质的产品和服务"],
                     "max_title_length": 490}
