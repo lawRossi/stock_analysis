@@ -13,7 +13,6 @@ from pdfminer.layout import LTTextContainer, LTTextLineHorizontal
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 
-
 section_title = re.compile(r"(?P<section_name>第\s*(\d+|[一二三四五六七八九十]+)\s*节.+)")
 
 
@@ -164,8 +163,10 @@ def extract_head_foot_note(pdf_file):
     if count < 5:
         top = None
     bottom, count = get_most_common(bottoms)
+
     if count < 5:
         bottom = None
+
     return top, bottom
 
 
@@ -397,6 +398,9 @@ patterns = [re.compile(item) for item in serial_numbers]
 
 def segment_paragraph(lines):
     paragraphs = []
+    if not lines:
+        return paragraphs
+
     para = ""
     prev_len = None
     indent = None
@@ -452,18 +456,18 @@ def segment_paragraph(lines):
 
 
 def arrange_elements(elements):
-    lines = [element["line"] for element in elements if "line" in element]
+    lines = [element for element in elements if isinstance(element, LTTextLineHorizontal)]
     paragraphs = segment_paragraph(lines)
     para_idx = -1
     offset = 0
     new_elements = []
     for element in elements:
-        if "line" in element:
+        if isinstance(element, LTTextLineHorizontal):
             if para_idx == -1:
                 para_idx += 1
                 new_elements.append({"text": paragraphs[para_idx]})
                 continue
-            text = element["line"].get_text().strip()
+            text = element.get_text().strip()
             paragraph = paragraphs[para_idx]
             idx = paragraph.find(text, offset)
             if idx == -1:
@@ -509,14 +513,14 @@ def extract_pdf_elements(pdf_file, table_settings={}):
     for page in pages:
         for i, element in enumerate(page):
             if isinstance(element, LTTextLineHorizontal):
-                all_elements.append({"line": element})
+                all_elements.append(element)
             elif isinstance(element, dict):
                 all_elements.append(element)
             else:
                 table = {"table": element}
                 if all_elements:
-                    if "line" in all_elements[-1]:
-                        text = all_elements[-1]["line"].get_text()
+                    if isinstance(all_elements[-1], LTTextLineHorizontal):
+                        text = all_elements[-1].get_text()
                         if "单位:" in text or "单位：" in text:
                             head_note = text.strip()
                             all_elements.pop()
@@ -528,9 +532,8 @@ def extract_pdf_elements(pdf_file, table_settings={}):
                             table = None
                 if table:
                     all_elements.append(table)
-    elements = arrange_elements(all_elements)
 
-    return elements
+    return all_elements
 
 
 def get_serial_number(match):
@@ -631,29 +634,16 @@ def segment_elements(elements, config={"max_title_length": 490}):
     return parts
 
 
-def pdf2html(pdf_file, save_file, table_settings={}):
+def pdf2html(pdf_file, save_file, table_settings={}, parsing_config={}):
     elements = extract_pdf_elements(pdf_file, table_settings)
-    parts = segment_elements(elements)
-
-    with open("pdf.html", encoding="utf-8") as fi:
+    document = parse_segment(elements, parsing_config)
+    document = refine_document(document)
+    template_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "templates/pdf.html")
+    with open(template_file, encoding="utf-8") as fi:
         html = fi.read()
-
-    content = ""
-    for part in parts:
-        content += "=====================<br/>"
-        for element in part:
-            if "text" in element:
-                content += f"<p>{element['text']}</p>\n"
-            elif "image" in element:
-                uri = base64.b64encode(element["image"]).decode("utf-8")
-                content += f'<div align="center"><img src="data:image/jpeg;base64,{uri}"></div>'
-            else:
-                if "head_note" in element:
-                    content += f'<div class="head-note"><span>{element["head_note"]}</span></div>'
-                table = element["table"]
-                content += '<div class="table-container">' + table.df.to_html(header=False, index=False).replace("\\n", "") + '</div>'
-                content += "<br/>"
+    content = document2html(document)
     html = html.replace("{{content}}", content)
+
     with open(save_file, "w", encoding="utf-8") as fo:
         fo.write(html)
 
@@ -774,52 +764,58 @@ def convert_document(document):
             convert_document(part)
 
 
+def document2html(document, level=1):
+    content = ""
+    if document["title"]:
+        title = document["title"].get_text().strip()
+        if level < 3:
+            content += f"<h{level}>{title}</h{level}>"
+        else:
+            content += f"<b>{title}</b>"
+    if document["content"]:
+        elements = arrange_elements(document["content"])
+        for element in elements:
+            if "text" in element:
+                content += f"<p>{element['text']}</p>\n"
+            elif "image" in element:
+                uri = base64.b64encode(element["image"]).decode("utf-8")
+                content += f'<div align="center"><img src="data:image/jpeg;base64,{uri}"></div>'
+            else:
+                if "head_note" in element:
+                    content += f'<div class="head-note"><span>{element["head_note"]}</span></div>'
+                table = element["table"]
+                content += '<div class="table-container">' + table.df.to_html(header=False, index=False).replace("\\n", "") + '</div>'
+                content += "<br/>"
+    if document["parts"]:
+        for part in document["parts"]:
+            content += document2html(part, level+1)
+
+    return content
+
+
 if __name__ == "__main__":
 
     # section_titles = parse_toc("data/report3.pdf")
     # segment_by_section("data/report3.pdf", section_titles, "data/zhanghang")
 
     # ts = {"engine": "camelot", "line_scale": 40, "strp_text": "\n", "split_text": True}
-    # summarize_pdf2html("data/zhanghang/第三章管理层讨论与分析.pdf", "data/s5.html", ts)
-
-    # for file in os.listdir("data/yili"):
-    #     print(file)
-    #     save_file = file.replace(".pdf", ".html")
-    #     pdf2html(f"./data/yili/{file}", f"data/{save_file}", ts)
-
-    # elements = extract_pdf_elements("./data/yili/2.pdf", ts)
-    # content = "\n".join([element["text"] for element in elements if "text" in element])
-
-    # print(content)
-
-    # with open("data.txt", encoding="utf-8") as fi:
-    #     content = fi.read()
-
-    # content = segment_content(content)
-
-    # with open("segmented.txt", "w", encoding="utf-8") as fo:
-    #     fo.write("\n=============\n".join(content))
 
     import json
 
-    pdf_file = "data/yili/第三节管理层讨论与分析.pdf"
+    pdf_file = "data/yili/第四节公司治理.pdf"
     ts = {"engine": "camelot"}
-    top, bottom = extract_head_foot_note(pdf_file)
-    logger.info("start to extract page elements")
-    pages = extract_all_page_elements(pdf_file, top, bottom, ts)
-    elements = []
-    for page in pages:
-        elements.extend(page)
-    config = {"exceptional_titles": ["公司因不适用准则规定或国家秘密、商业秘密等特殊原因"], "max_title_length": 490}
 
-    segments = segment_elements(elements, config)
-    print(len(segments))
-    for i, segment in enumerate(segments):
-        with open(f"data/segment{i}.txt", "w", encoding="utf-8") as fo:
-            config = { #"explicit_seperators": {"报告期内主要经营情况": ["经营计划执行情况", "主营业务分析"]},
-                    "exceptional_titles": ["坚守“伊利即品质”信条，为消费者提供安全、健康、高品质的产品和服务"],
-                    "max_title_length": 490}
-            document = parse_segment(segment, config)
-            refine_document(document)
-            convert_document(document)
-            json.dump(document, fo, ensure_ascii=False, indent=4)
+    config = {"exceptional_titles": ["公司因不适用准则规定或国家秘密、商业秘密等特殊原因", "公司控股股东、实际控制人在保证公司资产、人员、财务"], "max_title_length": 490}
+
+    pdf2html(pdf_file, "data/yili/第四节公司治理.html", ts, config)
+
+    # config = { #"explicit_seperators": {"报告期内主要经营情况": ["经营计划执行情况", "主营业务分析"]},
+    #         "exceptional_titles": ["坚守“伊利即品质”信条，为消费者提供安全、健康、高品质的产品和服务"],
+    #         "max_title_length": 490}
+    # document = parse_segment(elements, config)
+    # document = refine_document(document)
+    # convert_document(document)
+
+    # with open("document.txt", "w", encoding="utf-8") as fo:
+    #     json.dump(document, fo, ensure_ascii=False, indent=4)
+    # print(document)
