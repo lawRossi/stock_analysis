@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 
 setup(
-    name="stock-analysis",
+    name="stock-ana",
     version="0.0.1",
     description="A stock analysis framework",
     author="Rossi",
