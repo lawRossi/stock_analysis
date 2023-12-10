@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<head>
+    <title>{{title}}</title>
+    <style type="text/css">
+        body {
+            background-color: rgb(219, 218, 218);
+        }
+
+        #content-container {
+            width: 800;
+            padding-left: 20px;
+            text-align: left;
+            background-color:rgb(245, 236, 224)
+        }
+        
+        .head-note {
+            text-align: right
+        }
+
+        .table-container {
+            width: 780;
+            overflow-x: scroll;
+        }
+
+        .dataframe {
+            font-size: 10pt;
+            border-collapse: collapse;
+            border: 1px solid silver;
+        }
+
+        .dataframe tr:nth-child(1) {
+            background-color: orange;
+        }
+        
+        .dataframe th, td {
+            padding: 5px;
+        }
+
+        .dataframe tr:nth-child(even) {
+            background-color: #E0E0E0;
+        }
+
+        .dataframe tr:hover {
+        background: silver;
+        cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <center>
+        <div id="content-container">
+            {{content}}
+        </div>
+    </center>
+
+</body>
